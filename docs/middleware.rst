@@ -24,12 +24,16 @@ You can define middleware to wrap task execution. This has a host of potential a
        return wrapper
 
 Middleware are structured as wrapped functions for maximum flexibility--not only can you run code before/after execution, you can also access and even modify the arguments or results.
-   
+
 .. warning::
    Adding named keyword arguments to middleware (such as ``ctx`` here) will shadow arguments in your tasks with the same name, so use with caution!
 
 .. note::
-   If you are looking for distributed tracing with OpenTelemetry, you don't need to write custom observability middleware. Check out the built-in :doc:`OpenTelemetry Integration <opentelemetry>` guide to get tracing working out of the box.
+    If you're trying to set up observability with OpenTelemetry, the |otel|_ package provides automated, end-to-end distributed tracing for
+    your streaQ task queues.
+
+.. |otel| replace:: ``opentelemetry-instrumentation-streaq``
+.. _otel: https://github.com/definite-d/opentelemetry-instrumentation-streaq
 
 Stacking middleware
 -------------------
