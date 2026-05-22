@@ -79,7 +79,6 @@ Feature comparison
    middleware
    cli
    integrations
-   opentelemetry
    contributing
 
 .. toctree::
