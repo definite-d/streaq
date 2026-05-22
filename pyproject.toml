@@ -55,8 +55,8 @@ authors = [
     { name = "Graeme Holliday", email = "graeme@tastyware.dev" }
 ]
 dependencies = [
-    "anyio>=4.12.1",
-    "coredis>=6.1.0",
+    "anyio>=4.13.0",
+    "coredis>=6.6.1",
     "crontab>=1.0.5",
     "typer>=0.19.2",
     "watchfiles>=1.1.0",
@@ -84,7 +84,6 @@ Changelog = "https://github.com/tastyware/streaq/releases"
 
 [dependency-groups]
 dev = [
-    "enum-tools[sphinx]>=0.13.0",
     "httpx>=0.28.1",
     "pyright>=1.1.406",
     "pytest>=8.4.2",

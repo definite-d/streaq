@@ -24,6 +24,7 @@ from streaq.types import (
     Streaq,
     StreaqError,
     SyncTask,
+    TaskContext,
     Ts,
     TypedCoroutine,
 )
@@ -33,15 +34,21 @@ if TYPE_CHECKING:  # pragma: no cover
     from streaq.worker import Worker
 
 
+# TODO: update to StrEnum when 3.10 support is dropped
 class TaskStatus(str, Enum):
     """
     Enum of possible task statuses:
     """
 
+    #: task doesn't exist in Redis
     NOT_FOUND = "missing"
+    #: task is in the live queue
     QUEUED = "queued"
+    #: task is running on a worker
     RUNNING = "running"
+    #: task is in the delayed queue
     SCHEDULED = "scheduled"
+    #: task was completed
     DONE = "done"
 
 
@@ -334,16 +341,19 @@ class Task(Generic[R]):
         """
         return await self.worker.info_by_id(self.id)
 
-    async def unschedule(self) -> None:
+    async def unschedule(self) -> bool:
         """
         Stop scheduling the repeating task if registered.
+
+        :return: whether the task was unscheduled successfully
         """
-        await self.worker.unschedule_by_id(self.id)
+        return await self.worker.unschedule_by_id(self.id)
 
 
 @dataclass(kw_only=True)
 class RegisteredTask:
     expire: timedelta | int | None
+    max_schedule_drift: timedelta | int | None
     max_tries: int | None
     silent: bool
     timeout: timedelta | int | None
@@ -352,6 +362,19 @@ class RegisteredTask:
     fn_name: str
     crontab: str | None
     worker: Worker[Any]
+    depends: dict[str, type]
+
+    def build_context(self, id: str, tries: int = 1) -> TaskContext:
+        """
+        Creates the context for a task to be run given task metadata
+        """
+        return TaskContext(
+            fn_name=self.fn_name,
+            task_id=id,
+            timeout=self.timeout,
+            tries=tries,
+            ttl=self.ttl,
+        )
 
 
 @dataclass(kw_only=True)

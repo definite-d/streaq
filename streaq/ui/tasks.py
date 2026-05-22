@@ -1,13 +1,17 @@
 from collections.abc import Callable
 from datetime import datetime
+from statistics import mean
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response
+from anyio.functools import lru_cache
+from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response, status
 from fastapi import status as fast_status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
 from streaq import TaskStatus, Worker
+from streaq.constants import REDIS_HEALTH
+from streaq.task import TaskInfo, TaskResult
 from streaq.ui.deps import (
     get_exception_formatter,
     get_result_formatter,
@@ -39,19 +43,23 @@ class TaskData(BaseModel):
     url: str
 
 
+@lru_cache(ttl=1)
+async def _get_statuses(
+    worker: Worker[Any], statuses: tuple[TaskStatus, ...]
+) -> tuple[list[TaskInfo] | list[TaskResult[Any]], ...]:
+    return await gather(*[worker.get_tasks_by_status(s) for s in statuses])
+
+
 async def _get_context(
-    worker: Worker[Any],
-    task_url: str,
-    descending: bool,
-    statuses: list[TaskStatus] | None,
+    worker: Worker[Any], base_url: str, statuses: list[TaskStatus] | None
 ) -> dict[str, Any]:
     # Fetch all task types - explicit calls for proper typing
-    statuses = statuses or list(_STATUS_COLORS)
-    alL_tasks = await gather(*[worker.get_tasks_by_status(s) for s in statuses])
+    _statuses = tuple(statuses or _STATUS_COLORS.keys())
+    all_tasks = await _get_statuses(worker, _statuses)
     tasks: list[TaskData] = []
     counts: dict[str, int] = {s.value: 0 for s in _STATUS_COLORS}
-    for i, items in enumerate(alL_tasks):
-        status = statuses[i]
+    for i, items in enumerate(all_tasks):
+        status = _statuses[i]
         color, text_color = _STATUS_COLORS[status]
         counts[status.value] = len(items)
         for item in items:
@@ -65,10 +73,10 @@ async def _get_context(
                     task_id=item.task_id,
                     fn_name=item.fn_name,
                     sort_time=dt,
-                    url=task_url.format(task_id=item.task_id),
+                    url=base_url + f"task/{item.task_id}",
                 )
             )
-    tasks.sort(key=lambda td: td.sort_time, reverse=descending)
+    tasks.sort(key=lambda td: td.sort_time, reverse=True)
     return {
         "functions": list(worker.registry.keys()),
         "tasks": tasks,
@@ -82,14 +90,10 @@ async def get_context(
     worker: Worker[Any],
     functions: list[str] | None = None,
     statuses: list[TaskStatus] | None = None,
-    sort: str = "desc",
 ) -> dict[str, Any]:
-    task_url = request.url_for("get_task", task_id="{task_id}").path
-    tasks_filter_url = request.url_for("filter_tasks").path
-
-    descending = sort == "desc"
-    context = await _get_context(worker, task_url, descending, statuses)
-    context["tasks_filter_url"] = tasks_filter_url
+    base_url = request.url_for("get_root").path
+    context = await _get_context(worker, base_url, statuses)
+    context["base_url"] = base_url
 
     if functions:
         context["tasks"] = [t for t in context["tasks"] if t.fn_name in functions]
@@ -119,11 +123,10 @@ async def get_tasks(
 async def filter_tasks(
     request: Request,
     worker: Annotated[Worker[Any], Depends(get_worker)],
-    sort: Annotated[str, Form()],
     functions: Annotated[list[str] | None, Form()] = None,
     statuses: Annotated[list[TaskStatus] | None, Form()] = None,
 ) -> Any:
-    context = await get_context(request, worker, functions, statuses, sort)
+    context = await get_context(request, worker, functions, statuses)
     return templates.TemplateResponse(request, "table.j2", context=context)
 
 
@@ -197,6 +200,7 @@ async def get_task(
         request,
         "task.j2",
         context={
+            "base_url": request.url_for("get_root").path,
             "color": color,
             "function": function,
             "is_done": is_done,
@@ -205,7 +209,6 @@ async def get_task(
             "title": "task",
             "status": status.value,
             "task_id": task_id,
-            "task_abort_url": request.url_for("abort_task", task_id=task_id).path,
             "task_try": task_try,
             "worker_id": worker_id,
             **extra,
@@ -222,3 +225,78 @@ async def abort_task(
 ) -> None:
     await worker.abort_by_id(task_id, timeout=3)
     response.headers["HX-Redirect"] = request.url_for("get_tasks").path
+
+
+@router.get("/workers", response_class=HTMLResponse)
+async def get_workers(
+    request: Request,
+    worker: Annotated[Worker[Any], Depends(get_worker)],
+) -> Any:
+    worker_keys: list[str] = []
+    cursor = 0
+    while True:
+        cursor, keys = await worker.redis.scan(
+            cursor=cursor, match=worker.prefix + REDIS_HEALTH + "*", count=500
+        ).route(worker.queue_name)
+        worker_keys.extend(keys)
+        if cursor == 0:
+            break
+    context: dict[str, Any] = {"base_url": request.url_for("get_root").path}
+    if worker_keys:
+        workers = await worker.redis.mget(worker_keys)
+        context["all"] = [
+            (key.split(":")[-1], " ".join(health.split(" ")[2:]))
+            for key, health in zip(worker_keys, workers)
+            if health
+        ]
+    tasks = await worker.get_tasks_by_status(TaskStatus.DONE, limit=1000)
+    if tasks:
+        wait_times = [t.start_time - t.enqueue_time for t in tasks]
+        tries = [t.tries for t in tasks]
+        # 10 ms bounded slowdown
+        slowdowns = [
+            (t.finish_time - t.enqueue_time) / max(t.finish_time - t.start_time, 10)
+            for t in tasks
+        ]
+        context["avg_wait_time"] = mean(wait_times)
+        context["avg_slowdown"] = mean(slowdowns)
+        context["avg_tries"] = mean(tries)
+        context["success_rate"] = sum(t.success for t in tasks) / len(tasks) * 100
+    return templates.TemplateResponse(request, "workers.j2", context=context)
+
+
+@router.get("/cron", response_class=HTMLResponse)
+async def get_cronjobs(
+    request: Request,
+    worker: Annotated[Worker[Any], Depends(get_worker)],
+) -> Any:
+    async with worker.redis.pipeline(transaction=True) as pipe:
+        commands = (
+            pipe.hgetall(worker.cron_registry_key),
+            pipe.zrange(worker.cron_schedule_key, 0, -1, withscores=True),
+        )
+    registry, schedule = await commands[0], await commands[1]
+    ordered_names = [str(k) for k, _ in schedule]
+    return templates.TemplateResponse(
+        request,
+        "cron.j2",
+        context={
+            "base_url": request.url_for("get_root").path,
+            "registry": {n: registry[n] for n in ordered_names},
+            "schedule": {
+                k: datetime.fromtimestamp(v / 1000, tz=worker.tz).strftime(_fmt)
+                for k, v in schedule
+            },
+        },
+    )
+
+
+@router.delete("/cron/{name}")
+async def delete_cronjob(
+    name: str, worker: Annotated[Worker[Any], Depends(get_worker)]
+) -> None:
+    res = await worker.unschedule_by_id(name)
+    if not res:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Cron job not found!"
+        )

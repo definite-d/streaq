@@ -8,13 +8,14 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
 import pytest
 from anyio import create_task_group, sleep
 from coredis import RedisCluster
-from coredis.typing import Node
+from coredis.connection import TCPLocation
 
 from streaq.constants import REDIS_TASK
 from streaq.task import TaskStatus
@@ -59,15 +60,12 @@ async def test_health_check(redis_url: str):
     worker = Worker(
         redis_url=redis_url,
         redis_kwargs={"decode_responses": True},
-        health_crontab="* * * * * * *",
         queue_name=uuid4().hex,
     )
     async with run_worker(worker):
-        await sleep(2)
-        worker_health = await worker.redis.get(f"{worker._health_key}:{worker.id}")
-        redis_health = await worker.redis.get(worker._health_key + ":redis")
+        await sleep(1)
+        worker_health = await worker.redis.get(worker._health_key)
         assert worker_health is not None
-        assert redis_health is not None
 
 
 async def test_queue_size(worker: Worker):
@@ -174,7 +172,7 @@ async def test_reclaim_backed_up(redis_url: str):
 
 
 async def test_reclaim_idle_task(redis_url: str):
-    worker2 = Worker(redis_url=redis_url, queue_name="reclaim", idle_timeout=3)
+    worker2 = Worker(redis_url=redis_url, queue_name=uuid4().hex, idle_timeout=3)
 
     @worker2.task(name="foo")
     async def foo() -> None:
@@ -183,7 +181,9 @@ async def test_reclaim_idle_task(redis_url: str):
     # get task ID
     task = foo.enqueue()
     # run separate worker which will enqueue and pick up task
-    worker = subprocess.Popen([sys.executable, "tests/failure.py", redis_url, task.id])
+    worker = subprocess.Popen(
+        [sys.executable, "tests/failure.py", redis_url, task.id, worker2.queue_name]
+    )
     async with worker2:
         while (await task.status()) == TaskStatus.NOT_FOUND:
             await sleep(1)
@@ -323,7 +323,7 @@ def test_cluster_connection_pool():
     from coredis import ClusterConnectionPool
 
     pool = ClusterConnectionPool(
-        startup_nodes=[Node(host="cluster-1", port=7000)], decode_responses=True
+        startup_nodes=[TCPLocation("cluster-1", 7000)], decode_responses=True
     )
     worker = Worker(redis_pool=pool, queue_name=f"{{{uuid4().hex}}}")
     worker2 = Worker(redis_pool=pool, queue_name=worker.queue_name)
@@ -521,3 +521,48 @@ async def test_get_tasks_by_status_empty_done(worker: Worker):
     async with worker:
         completed = await worker.get_tasks_by_status(TaskStatus.DONE)
         assert completed == []
+
+
+def test_health_tab():
+    with pytest.warns(match="deprecated as it no longer does anything"):
+        _ = Worker(health_crontab="*/5 * * * *")
+
+
+async def test_cron_max_schedule_drift_stale(worker: Worker):
+    @worker.cron("* * * * *", max_schedule_drift=timedelta(seconds=5))
+    async def every_minute() -> None: ...
+
+    async with create_task_group() as tg:
+        await tg.start(worker.run_async)
+        # simulate previously enqueued with old timestamp
+        task = await every_minute.enqueue().start(schedule=datetime(2022, 2, 22))
+        result = await task.result(5)
+        assert not result.success
+        assert "max schedule drift" in str(result.exception)
+        tg.cancel_scope.cancel()
+
+
+async def test_cron_max_schedule_drift_fresh(worker: Worker):
+    @worker.cron("* * * * *", max_schedule_drift=timedelta(seconds=5))
+    async def every_minute() -> None: ...
+
+    async with create_task_group() as tg:
+        await tg.start(worker.run_async)
+        # simulate previously enqueued with old timestamp
+        task = await every_minute.enqueue()
+        result = await task.result(5)
+        assert result.success
+        tg.cancel_scope.cancel()
+
+
+async def test_cron_no_max_schedule_drift(worker: Worker):
+    @worker.cron("* * * * *")
+    async def every_minute() -> None: ...
+
+    async with create_task_group() as tg:
+        await tg.start(worker.run_async)
+        # simulate previously enqueued with old timestamp
+        task = await every_minute.enqueue().start(schedule=datetime(2022, 2, 22))
+        result = await task.result(5)
+        assert result.success
+        tg.cancel_scope.cancel()
